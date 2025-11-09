@@ -11,6 +11,7 @@ import time
 import random
 import logging
 import asyncio
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional, Dict, List
 from datetime import datetime
@@ -18,6 +19,9 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 import re
+
+import boto3
+from botocore.exceptions import ClientError
 
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -41,66 +45,195 @@ PLAYWRIGHT_USER_DATA_DIR.mkdir(exist_ok=True)
 SELENIUM_WAIT_SECONDS = int(os.getenv("SELENIUM_WAIT_SECONDS", "8"))  # используем как задержку для Playwright
 PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "1") != "0"
 PLAYWRIGHT_CONTEXT_NAME = "tour_kassa_context"  # директория внутри playwright_sessions
+PLAYWRIGHT_STORAGE_STATE_PATH = PLAYWRIGHT_USER_DATA_DIR / "storage_state.json"
+
+STORAGE_ENDPOINT = os.getenv("STORAGE_ENDPOINT", "https://storage.yandexcloud.net")
+STORAGE_BUCKET = os.getenv("STORAGE_BUCKET")
+STORAGE_STATE_KEY = os.getenv("STORAGE_STATE_KEY", "playwright/storage_state.json")
+STORAGE_ACCESS_KEY = os.getenv("STORAGE_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID")
+STORAGE_SECRET_KEY = os.getenv("STORAGE_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+
+
+def _is_storage_configured() -> bool:
+    return all([STORAGE_BUCKET, STORAGE_STATE_KEY, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY])
+
+
+_storage_client = None
+
+
+def get_storage_client():
+    global _storage_client
+    if not _is_storage_configured():
+        raise ValueError("Object Storage credentials are not fully configured")
+    if _storage_client is None:
+        _storage_client = boto3.client(
+            "s3",
+            endpoint_url=STORAGE_ENDPOINT,
+            aws_access_key_id=STORAGE_ACCESS_KEY,
+            aws_secret_access_key=STORAGE_SECRET_KEY,
+            region_name="ru-central1",
+        )
+    return _storage_client
+
+
+def upload_storage_state(local_path: Path) -> None:
+    if not _is_storage_configured():
+        logger.debug("Skipping storage_state upload — storage is not configured")
+        return
+    if not local_path.exists():
+        logger.warning(f"Cannot upload storage_state: {local_path} does not exist")
+        return
+    try:
+        client = get_storage_client()
+        client.put_object(
+            Bucket=STORAGE_BUCKET,
+            Key=STORAGE_STATE_KEY,
+            Body=local_path.read_bytes(),
+            ContentType="application/json; charset=utf-8",
+        )
+        logger.info("storage_state.json uploaded to Object Storage")
+    except Exception as exc:
+        logger.warning(f"Unable to upload storage_state.json: {exc}")
+
+
+
+def refresh_storage_state() -> Optional[Path]:
+    """
+    Download storage_state.json from Yandex Object Storage if credentials are provided.
+    Keeps the previous local copy when refresh fails.
+    """
+    if not _is_storage_configured():
+        return PLAYWRIGHT_STORAGE_STATE_PATH if PLAYWRIGHT_STORAGE_STATE_PATH.exists() else None
+
+    try:
+        client = get_storage_client()
+        obj = client.get_object(Bucket=STORAGE_BUCKET, Key=STORAGE_STATE_KEY)
+        PLAYWRIGHT_STORAGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PLAYWRIGHT_STORAGE_STATE_PATH.write_bytes(obj["Body"].read())
+        logger.info("Storage state downloaded from object storage")
+        return PLAYWRIGHT_STORAGE_STATE_PATH
+    except ClientError as exc:
+        logger.warning(f"Object storage error while fetching storage_state.json: {exc}")
+        return PLAYWRIGHT_STORAGE_STATE_PATH if PLAYWRIGHT_STORAGE_STATE_PATH.exists() else None
+    except Exception as exc:
+        logger.warning(f"Unable to refresh storage state: {exc}")
+        return PLAYWRIGHT_STORAGE_STATE_PATH if PLAYWRIGHT_STORAGE_STATE_PATH.exists() else None
+
+
 
 class PlaywrightHelper:
     """
-    Асинхронный helper для получения HTML через Playwright persistent context.
-    Сохраняет и переиспользует контекст в каталоге PLAYWRIGHT_USER_DATA_DIR/PLAYWRIGHT_CONTEXT_NAME.
+    Асинхронный helper для получения HTML через Playwright и синхронизации storage_state.json с Object Storage.
     """
 
-    def __init__(self, user_agent: Optional[str] = None, headless: bool = True):
+    STEALTH_INIT_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    window.chrome = window.chrome || { runtime: {} };
+    """
+
+    def __init__(self, user_agent: Optional[str] = None, headless: bool = True, storage_state_path: Optional[Path] = None):
         self.user_agent = user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         )
         self.headless = headless
-        self.user_data_dir = PLAYWRIGHT_USER_DATA_DIR / PLAYWRIGHT_CONTEXT_NAME
+        self.storage_state_path = storage_state_path
 
-    async def get_page_html(self, url: str, wait_seconds: int = SELENIUM_WAIT_SECONDS) -> Optional[str]:
+    async def get_page_html(
+        self,
+        url: str,
+        wait_seconds: int = SELENIUM_WAIT_SECONDS,
+        wait_selector: Optional[str] = None,
+    ) -> Optional[str]:
         """
-        Запускает Playwright, создаёт/использует persistent context, переходит на страницу и возвращает HTML.
-        При успехе возвращает HTML, при ошибке — None.
+        Запускает Playwright, открывает Chromium и применяет storage state, чтобы вернуть HTML страницы.
         """
+        browser = None
+        context = None
         try:
             async with async_playwright() as p:
-                # Запуск persistent context (он сам поднимет Chromium)
-                browser_type = p.chromium
-                # launch_persistent_context возвращает context, но требует путь к user_data_dir
-                context = await browser_type.launch_persistent_context(
-                    user_data_dir=str(self.user_data_dir),
+                browser = await p.chromium.launch(
                     headless=self.headless,
                     args=["--disable-blink-features=AutomationControlled"],
-                    viewport={"width": 1280, "height": 800},
-                    user_agent=self.user_agent,
                 )
+                context_kwargs = {
+                    "viewport": {"width": 1280, "height": 800},
+                    "user_agent": self.user_agent,
+                    "locale": "ru-RU",
+                    "timezone_id": "Europe/Moscow",
+                }
+                if self.storage_state_path and self.storage_state_path.exists():
+                    context_kwargs["storage_state"] = str(self.storage_state_path)
+
+                context = await browser.new_context(**context_kwargs)
+                await context.add_init_script(self.STEALTH_INIT_SCRIPT)
+                await context.set_extra_http_headers(
+                    {"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"}
+                )
+
                 page = await context.new_page()
-                # Навигация
-                await page.goto(url, timeout=90000)
-                # Даём JS-челленджу время выполниться
+                await page.goto(url, wait_until="networkidle", timeout=90000)
+
+                if wait_selector:
+                    await page.wait_for_selector(
+                        wait_selector, timeout=max(wait_seconds, 3) * 1000
+                    )
+                else:
+                    await page.wait_for_load_state("networkidle")
+
                 await asyncio.sleep(random.uniform(wait_seconds, wait_seconds + 3))
                 html = await page.content()
-                # Закрываем context (при persistent context закрытие сохранит state)
-                await context.close()
+
+                if self.storage_state_path:
+                    try:
+                        self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                        await context.storage_state(path=str(self.storage_state_path))
+                        upload_storage_state(self.storage_state_path)
+                    except Exception as storage_exc:
+                        logger.warning(f"Failed to persist storage_state.json: {storage_exc}")
+
                 return html
         except Exception as e:
             logger.warning(f"Playwright error for {url}: {e}")
             return None
-        
-    def fetch(self, url: str, wait_seconds: int = SELENIUM_WAIT_SECONDS) -> Optional[str]:
+        finally:
+            if context:
+                with suppress(Exception):
+                    await context.close()
+            if browser:
+                with suppress(Exception):
+                    await browser.close()
+
+    def fetch(
+        self,
+        url: str,
+        wait_seconds: int = SELENIUM_WAIT_SECONDS,
+        wait_selector: Optional[str] = None,
+    ) -> Optional[str]:
         """
-        Синхронная обертка — вызывает асинхронный метод внутри event loop.
+        Синхронная обертка — запускает асинхронный Playwright из текущего event loop.
         """
-        # Если уже есть запущенный loop (редко в CLI), используем asyncio.run в новом процессе
         try:
-            return asyncio.run(self.get_page_html(url, wait_seconds=wait_seconds))
-        except Exception as e:
-            # На некоторых окружениях asyncio.run может выдать ошибку, попытаемся ручной цикл
+            return asyncio.run(
+                self.get_page_html(
+                    url,
+                    wait_seconds=wait_seconds,
+                    wait_selector=wait_selector,
+                )
+            )
+        except Exception:
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                res = loop.run_until_complete(self.get_page_html(url, wait_seconds=wait_seconds))
+                result = loop.run_until_complete(
+                    self.get_page_html(
+                        url,
+                        wait_seconds=wait_seconds,
+                        wait_selector=wait_selector,
+                    )
+                )
                 loop.close()
-                return res
+                return result
             except Exception as ee:
                 logger.error(f"Failed to run Playwright loop: {ee}")
                 return None
@@ -115,7 +248,11 @@ class CurrencyScraper:
         self.session = requests.Session()
         self.results: List[Dict] = []
         self.errors: List[str] = []
-        self.playwright = PlaywrightHelper(headless=PLAYWRIGHT_HEADLESS)
+        self.storage_state_path = refresh_storage_state()
+        self.playwright = PlaywrightHelper(
+            headless=PLAYWRIGHT_HEADLESS,
+            storage_state_path=self.storage_state_path,
+        )
         self.user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
@@ -145,8 +282,8 @@ class CurrencyScraper:
     
     def make_request(self, url: str, retries: int = 3, timeout: int = 120) -> Optional[BeautifulSoup]:
         """
-        Для tour-kassa.ru используем Playwright, иначе requests.Session.
-        Возвращает BeautifulSoup или None.
+        Для tour-kassa.ru используем Playwright, для остальных сайтов — requests.Session.
+        Возвращает BeautifulSoup либо None.
         """
         for attempt in range(retries):
             try:
@@ -154,16 +291,26 @@ class CurrencyScraper:
 
                 if 'tour-kassa.ru' in url:
                     logger.info(f"Using Playwright for {url} (attempt {attempt+1})")
-                    html = self.playwright.fetch(url)
+                    html = self.playwright.fetch(
+                        url,
+                        wait_selector='table.mod_rate_today',
+                    )
                     if not html:
                         raise Exception("Playwright failed to fetch HTML")
-                    # Проверим, не страница ли это interstitial
+
                     lower = html.lower()
-                    if 'ваш браузер не смог пройти проверку' in lower or 'подождите, идет проверка вашего браузера' in lower or 'js-challenge' in lower:
+                    challenge_tokens = [
+                        'Пожалуйста подтвердите, что вы человек',
+                        'Похоже, что вы робот',
+                        'js-challenge',
+                        'cf-chl',
+                        'attention required',
+                    ]
+                    if any(token in lower for token in challenge_tokens):
                         raise Exception("Playwright returned interstitial / challenge page")
+
                     return BeautifulSoup(html, 'html.parser')
 
-                # special case for cruclub.ru (как в старом коде)
                 if 'cruclub.ru' in url:
                     temp_session = requests.Session()
                     temp_session.headers.update({
@@ -176,16 +323,15 @@ class CurrencyScraper:
                     })
                     resp = temp_session.get(url, timeout=timeout, verify=False)
                     temp_session.close()
-                    resp.raise_for_status()
-                    resp.encoding = resp.apparent_encoding
-                    time.sleep(random.uniform(1, 2))
-                    return BeautifulSoup(resp.content, 'html.parser')
                 else:
                     verify_ssl = 'tourtrans.ru' not in url
-                    resp = self.session.get(url, headers=headers, timeout=120, verify=verify_ssl)
+                    resp = self.session.get(
+                        url,
+                        headers=headers,
+                        timeout=timeout,
+                        verify=verify_ssl,
+                    )
 
-                # стандартный flow
-                resp = self.session.get(url, headers=headers, timeout=timeout)
                 resp.raise_for_status()
                 resp.encoding = resp.apparent_encoding
                 time.sleep(random.uniform(0.8, 2.0))
@@ -199,7 +345,7 @@ class CurrencyScraper:
                 else:
                     self.errors.append(f"Failed to fetch {url}: {e}")
                     return None
-                
+
     def scrape_tour_kassa_site(self, url: str):
         """
         Пример парсинга таблицы tour-kassa (использует make_request с Playwright).
@@ -239,6 +385,7 @@ class CurrencyScraper:
         table = soup.find('table', class_='mod_rate_today')
         if not table:
             logger.error("mod_rate_today table not found on tour-kassa")
+            return []
 
         # Группировка операторов
         operator_groups = {}
@@ -249,7 +396,7 @@ class CurrencyScraper:
         
         # Обработка каждого оператора
         for operator_name, operator_items in operator_groups.items():
-            operator_data = self._get_exchange_rates_by_operator(soup, operator_name)
+            operator_data = self._get_exchange_rates_by_operator(table, operator_name)
             
             if operator_data:
                 for item in operator_items:
@@ -267,28 +414,28 @@ class CurrencyScraper:
         
         return results
     
-    def _get_exchange_rates_by_operator(self, soup: BeautifulSoup, operator_name: str) -> Optional[Dict]:
-        '''Поиск курсов валют по названию оператора'''
-        rows = soup.find_all('tr')
-        
+    def _get_exchange_rates_by_operator(self, table: BeautifulSoup, operator_name: str) -> Optional[Dict]:
+        '''Извлекает блоки с курсами конкретного туроператора'''
+        rows = table.find_all('tr')
+        target_name = self._normalize_operator_name(operator_name)
+
         for row in rows:
             operator_cell = row.find('td', class_='mod_rate_oper')
             if not operator_cell:
                 continue
-            
-            # Извлечение названия оператора
+
             div_element = operator_cell.find('div')
             if not div_element:
                 continue
-            
-            # Получение текста оператора
+
             operator_text = div_element.get_text(strip=True).split('\n')[0].strip()
-            
-            # Проверка совпадения
-            if (operator_text == operator_name or 
-                operator_name in operator_text or 
-                operator_text in operator_name):
-                
+            normalized_operator = self._normalize_operator_name(operator_text)
+
+            if (
+                normalized_operator == target_name
+                or target_name in normalized_operator
+                or normalized_operator in target_name
+            ):
                 cells = row.find_all('td')
                 if len(cells) >= 7:
                     return {
@@ -301,11 +448,15 @@ class CurrencyScraper:
                             'rate': self.extract_rate(cells[4].get_text(strip=True)),
                             'percentage': cells[5].get_text(strip=True),
                             'delta': cells[6].get_text(strip=True)
-                        }
+                        },
                     }
-        
+
         return None
-    
+
+    @staticmethod
+    def _normalize_operator_name(name: str) -> str:
+        return re.sub(r'\s+', ' ', name).strip().lower()
+
     def scrape_paks_site(self, url: str) -> List[Dict]:
         '''Скреппинг сайта ПАКС'''
         soup = self.make_request(url)
@@ -443,7 +594,7 @@ class CurrencyScraper:
         html_content = str(rates_element)
         text_content = rates_element.get_text()
         
-        print(f"Найденный текст: {text_content[:200]}")  # Для отладки
+        logger.debug(f"Найденный текст: {text_content[:200]}")  # Для отладки
 
         # Ищем курсы с помощью регулярных выражений
         # Поиск в HTML коде (с тегами <b>)
@@ -465,20 +616,20 @@ class CurrencyScraper:
             try:
                 usd_rate = float(usd_str)
             except ValueError:
-                print(f"Ошибка конвертации USD: {usd_str}")
+                logger.debug(f"Ошибка конвертации USD: {usd_str}")
         
         if eur_match:
             eur_str = eur_match.group(1).replace(',', '.')
             try:
                 eur_rate = float(eur_str)
             except ValueError:
-                print(f"Ошибка конвертации EUR: {eur_str}")
+                logger.debug(f"Ошибка конвертации EUR: {eur_str}")
 
-        print(f"USD: {usd_rate}, EUR: {eur_rate}")  # Для отладки
+        logger.debug(f"USD: {usd_rate}, EUR: {eur_rate}")  # Для отладки
 
         # Возвращаем результат только если найдены оба курса
         if usd_rate is None or eur_rate is None:
-            print("Не удалось извлечь один или оба курса")
+            logger.debug("Не удалось извлечь один или оба курса")
             return []
 
         return [
@@ -757,7 +908,7 @@ class CurrencyScraper:
         
         try:
             # Получаем курс USD
-            print("Запрашиваем курс USD...")
+            logger.debug("Запрашиваем курс USD...")
             headers = self.get_random_headers() if hasattr(self, 'get_random_headers') else {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
@@ -766,37 +917,37 @@ class CurrencyScraper:
             usd_response.raise_for_status()
             usd_data = usd_response.json()
             
-            print(f"USD ответ: {usd_data}")
+            logger.debug(f"USD ответ: {usd_data}")
             
             if 'Currency_RATES' in usd_data and len(usd_data['Currency_RATES']) > 0:
                 usd_rate = usd_data['Currency_RATES'][0]['rate']
-                print(f"USD курс получен: {usd_rate}")
+                logger.debug(f"USD курс получен: {usd_rate}")
             
         except Exception as e:
-            print(f"Ошибка при получении курса USD: {str(e)}")
+            logger.debug(f"Ошибка при получении курса USD: {str(e)}")
             if hasattr(self, 'errors'):
                 self.errors.append(f"Ошибка получения USD курса Spectrum: {str(e)}")
         
         try:
             # Получаем курс EUR
-            print("Запрашиваем курс EUR...")
+            logger.debug("Запрашиваем курс EUR...")
             
             eur_response = self.session.get(eur_api_url, headers=headers, timeout=30)
             eur_response.raise_for_status()
             eur_data = eur_response.json()
             
-            print(f"EUR ответ: {eur_data}")
+            logger.debug(f"EUR ответ: {eur_data}")
             
             if 'Currency_RATES' in eur_data and len(eur_data['Currency_RATES']) > 0:
                 eur_rate = eur_data['Currency_RATES'][0]['rate']
-                print(f"EUR курс получен: {eur_rate}")
+                logger.debug(f"EUR курс получен: {eur_rate}")
             
         except Exception as e:
-            print(f"Ошибка при получении курса EUR: {str(e)}")
+            logger.debug(f"Ошибка при получении курса EUR: {str(e)}")
             if hasattr(self, 'errors'):
                 self.errors.append(f"Ошибка получения EUR курса Spectrum: {str(e)}")
         
-        print(f"Финальные курсы - USD: {usd_rate}, EUR: {eur_rate}")
+        logger.debug(f"Финальные курсы - USD: {usd_rate}, EUR: {eur_rate}")
         
         # Возвращаем результат
         return [
@@ -824,45 +975,45 @@ class CurrencyScraper:
         '''Скреппинг сайта Краски Мира'''
         soup = self.make_request(url)
         if not soup:
-            print("DEBUG: Не удалось получить soup")
+            logger.debug("DEBUG: Не удалось получить soup")
             return []
         
-        print("DEBUG: HTML получен успешно")
+        logger.debug("DEBUG: HTML получен успешно")
         
         # Выводим первые 1000 символов HTML для анализа
         html_text = str(soup)
-        print(f"DEBUG: Первые 1000 символов HTML:")
-        print(html_text[:1000])
-        print("=" * 50)
+        logger.debug(f"DEBUG: Первые 1000 символов HTML:")
+        logger.debug(html_text[:1000])
+        logger.debug("=" * 50)
         
         # Ищем любые упоминания валют в тексте
         all_text = soup.get_text()
-        print(f"DEBUG: Весь текст содержит {len(all_text)} символов")
+        logger.debug(f"DEBUG: Весь текст содержит {len(all_text)} символов")
         
         # Поиск слов "курс", "валют", "USD", "EUR" в тексте
         keywords = ['курс', 'валют', 'USD', 'EUR', 'RUR', 'рубл']
         for keyword in keywords:
             if keyword.lower() in all_text.lower():
-                print(f"DEBUG: Найдено ключевое слово '{keyword}' в тексте")
+                logger.debug(f"DEBUG: Найдено ключевое слово '{keyword}' в тексте")
             else:
-                print(f"DEBUG: Ключевое слово '{keyword}' НЕ найдено")
+                logger.debug(f"DEBUG: Ключевое слово '{keyword}' НЕ найдено")
         
         # Проверяем, есть ли блок с курсами валют
         currency_spans = soup.select('div.win div.body.small.dlist div.item span')
-        print(f"DEBUG: Найдено span элементов: {len(currency_spans)}")
+        logger.debug(f"DEBUG: Найдено span элементов: {len(currency_spans)}")
         
         # Выводим все найденные span элементы
         for i, span in enumerate(currency_spans):
             parent_text = span.parent.get_text()
             span_text = span.get_text()
-            print(f"DEBUG: Span {i}: parent='{parent_text}', span='{span_text}'")
+            logger.debug(f"DEBUG: Span {i}: parent='{parent_text}', span='{span_text}'")
         
         # Также попробуем найти блок с заголовком "КУРСЫ ВАЛЮТ"
         currency_headers = soup.find_all(string=lambda text: text and 'КУРСЫ ВАЛЮТ' in text)
-        print(f"DEBUG: Найдено заголовков с 'КУРСЫ ВАЛЮТ': {len(currency_headers)}")
+        logger.debug(f"DEBUG: Найдено заголовков с 'КУРСЫ ВАЛЮТ': {len(currency_headers)}")
 
         currency_spans = soup.select('div.win div.body.small.dlist div.item span')
-        print(f"DEBUG: Найдено span элементов: {len(currency_spans)}")
+        logger.debug(f"DEBUG: Найдено span элементов: {len(currency_spans)}")
         
         # Попробуем более широкий поиск
         all_spans = soup.find_all('span')
@@ -872,10 +1023,10 @@ class CurrencyScraper:
             if re.search(r'\d+\.\d+', text):
                 currency_related_spans.append((span, text))
         
-        print(f"DEBUG: Найдено span с числами: {len(currency_related_spans)}")
+        logger.debug(f"DEBUG: Найдено span с числами: {len(currency_related_spans)}")
         for span, text in currency_related_spans:
             parent_text = span.parent.get_text()
-            print(f"DEBUG: Числовой span: '{text}', parent: '{parent_text}'")
+            logger.debug(f"DEBUG: Числовой span: '{text}', parent: '{parent_text}'")
         
         usd_rate = ''
         eur_rate = ''
@@ -887,13 +1038,13 @@ class CurrencyScraper:
             if 'USD' in parent_text:
                 usd_match = re.search(r'\d+\.\d+', rate_text)
                 usd_rate = usd_match.group(0) if usd_match else ''
-                print(f"DEBUG: USD найден - parent: '{parent_text}', rate: '{rate_text}', результат: '{usd_rate}'")
+                logger.debug(f"DEBUG: USD найден - parent: '{parent_text}', rate: '{rate_text}', результат: '{usd_rate}'")
             elif 'EUR' in parent_text:
                 eur_match = re.search(r'\d+\.\d+', rate_text)
                 eur_rate = eur_match.group(0) if eur_match else ''
-                print(f"DEBUG: EUR найден - parent: '{parent_text}', rate: '{rate_text}', результат: '{eur_rate}'")
+                logger.debug(f"DEBUG: EUR найден - parent: '{parent_text}', rate: '{rate_text}', результат: '{eur_rate}'")
         
-        print(f"DEBUG: Финальные курсы - USD: '{usd_rate}', EUR: '{eur_rate}'")
+        logger.debug(f"DEBUG: Финальные курсы - USD: '{usd_rate}', EUR: '{eur_rate}'")
         
         return [
             {
@@ -977,29 +1128,29 @@ class CurrencyScraper:
         if not exchange_element:
             # Если не найден элемент, попробуем найти курсы по всему тексту страницы
             page_text = soup.get_text()
-            print(f"DEBUG: Элемент с курсами не найден. Ищем по всему тексту страницы...")
-            print(f"DEBUG: Фрагмент текста страницы: {page_text[:500]}...")
+            logger.debug(f"DEBUG: Элемент с курсами не найден. Ищем по всему тексту страницы...")
+            logger.debug(f"DEBUG: Фрагмент текста страницы: {page_text[:500]}...")
         else:
             page_text = exchange_element.get_text()
-            print(f"DEBUG: Найден элемент с курсами: {page_text}")
+            logger.debug(f"DEBUG: Найден элемент с курсами: {page_text}")
 
         # Используем регулярные выражения для поиска курсов
         usd_match = re.search(r'1\s*USD\s*=\s*([\d.,]+)\s*руб', page_text, re.IGNORECASE)
         eur_match = re.search(r'1\s*EUR\s*=\s*([\d.,]+)\s*руб', page_text, re.IGNORECASE)
         
-        print(f"DEBUG: USD match: {usd_match}")
-        print(f"DEBUG: EUR match: {eur_match}")
+        logger.debug(f"DEBUG: USD match: {usd_match}")
+        logger.debug(f"DEBUG: EUR match: {eur_match}")
         
         # Извлекаем курсы и конвертируем в float
         try:
             usd_rate = float(usd_match.group(1).replace(',', '.')) if usd_match else None
             eur_rate = float(eur_match.group(1).replace(',', '.')) if eur_match else None
         except (ValueError, AttributeError) as e:
-            print(f"DEBUG: Ошибка конвертации курсов: {e}")
+            logger.debug(f"DEBUG: Ошибка конвертации курсов: {e}")
             usd_rate = None
             eur_rate = None
         
-        print(f"DEBUG: USD rate: {usd_rate}, EUR rate: {eur_rate}")
+        logger.debug(f"DEBUG: USD rate: {usd_rate}, EUR rate: {eur_rate}")
 
         return [
             {

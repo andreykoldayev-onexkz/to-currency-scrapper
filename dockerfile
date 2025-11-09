@@ -19,7 +19,12 @@ ENV PYTHONUNBUFFERED=1 \
     OUTLOOK_EMAIL=andrey.koldayev@r-express.ru \
     OUTLOOK_PASSWORD=fUsVzN99! \
     TARGET_EMAIL=andrey.koldayev@r-express.ru \
-    API_URL=https://megapolus.bitrix24.ru/rest/11/pbjl5ed8q1303lh0/bizproc.workflow.start
+    API_URL=https://megapolus.bitrix24.ru/rest/11/pbjl5ed8q1303lh0/bizproc.workflow.start \
+    STORAGE_ENDPOINT=https://storage.yandexcloud.net \
+    STORAGE_BUCKET=cdn.mt-app.ru \
+    STORAGE_STATE_KEY=playwright/storage_state.json \
+    STORAGE_ACCESS_KEY=YCNSM6PNZ2bXop1KrwM_9Ko181cjHMUYxZx4gDhR \
+    STORAGE_SECRET_KEY=YCAJEeWXehH3VGs3lWYglf2rH
 
 # Запуск приложения
 CMD ["python", "app.py"]
