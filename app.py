@@ -61,6 +61,20 @@ def _is_storage_configured() -> bool:
 _storage_client = None
 
 
+def _storage_state_is_valid(path: Optional[Path]) -> bool:
+    if not path or not path.exists():
+        return False
+    try:
+        content = path.read_text(encoding="utf-8")
+        json.loads(content)
+        return True
+    except Exception as exc:
+        logger.warning(f"Invalid storage_state.json detected: {exc}")
+        with suppress(FileNotFoundError):
+            path.unlink()
+        return False
+
+
 def get_storage_client():
     global _storage_client
     if not _is_storage_configured():
@@ -78,10 +92,13 @@ def get_storage_client():
 
 def upload_storage_state(local_path: Path) -> None:
     if not _is_storage_configured():
-        logger.debug("Skipping storage_state upload — storage is not configured")
+        logger.debug("Skipping storage_state upload - storage is not configured")
         return
     if not local_path.exists():
         logger.warning(f"Cannot upload storage_state: {local_path} does not exist")
+        return
+    if not _storage_state_is_valid(local_path):
+        logger.warning("Local storage_state.json is invalid, skipping upload")
         return
     try:
         client = get_storage_client()
@@ -110,8 +127,12 @@ def refresh_storage_state() -> Optional[Path]:
         obj = client.get_object(Bucket=STORAGE_BUCKET, Key=STORAGE_STATE_KEY)
         PLAYWRIGHT_STORAGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         PLAYWRIGHT_STORAGE_STATE_PATH.write_bytes(obj["Body"].read())
-        logger.info("Storage state downloaded from object storage")
-        return PLAYWRIGHT_STORAGE_STATE_PATH
+        if _storage_state_is_valid(PLAYWRIGHT_STORAGE_STATE_PATH):
+            logger.info("Storage state downloaded from object storage")
+            return PLAYWRIGHT_STORAGE_STATE_PATH
+        else:
+            logger.warning("Downloaded storage_state.json is invalid; falling back to local state")
+            return PLAYWRIGHT_STORAGE_STATE_PATH if PLAYWRIGHT_STORAGE_STATE_PATH.exists() else None
     except ClientError as exc:
         logger.warning(f"Object storage error while fetching storage_state.json: {exc}")
         return PLAYWRIGHT_STORAGE_STATE_PATH if PLAYWRIGHT_STORAGE_STATE_PATH.exists() else None
@@ -162,7 +183,7 @@ class PlaywrightHelper:
                     "locale": "ru-RU",
                     "timezone_id": "Europe/Moscow",
                 }
-                if self.storage_state_path and self.storage_state_path.exists():
+                if _storage_state_is_valid(self.storage_state_path):
                     context_kwargs["storage_state"] = str(self.storage_state_path)
 
                 context = await browser.new_context(**context_kwargs)

@@ -23,8 +23,8 @@ ENV PYTHONUNBUFFERED=1 \
     STORAGE_ENDPOINT=https://storage.yandexcloud.net \
     STORAGE_BUCKET=cdn.mt-app.ru \
     STORAGE_STATE_KEY=playwright/storage_state.json \
-    STORAGE_ACCESS_KEY=YCNSM6PNZ2bXop1KrwM_9Ko181cjHMUYxZx4gDhR \
-    STORAGE_SECRET_KEY=YCAJEeWXehH3VGs3lWYglf2rH
+    STORAGE_ACCESS_KEY=YCAJEeWXehH3VGs3lWYglf2rH \
+    STORAGE_SECRET_KEY=YCNSM6PNZ2bXop1KrwM_9Ko181cjHMUYxZx4gDhR
 
 # Запуск приложения
 CMD ["python", "app.py"]
