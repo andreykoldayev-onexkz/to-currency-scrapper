@@ -11,20 +11,17 @@ COPY requirements.txt /app/requirements.txt
 # Устанавливаем зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# (Опционально) — можно установить только нужные браузеры
-RUN playwright install chromium --with-deps
+# Устанавливаем только Chromium (экономим место)
+RUN playwright install chromium
 
-# Устанавливаем переменные окружения (при необходимости можно переопределить в docker run / compose)
+# Создаем директорию для временных файлов
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+# Устанавливаем базовые переменные окружения
+# ВАЖНО: Секретные данные (пароли, ключи) должны передаваться через docker run -e или docker-compose
 ENV PYTHONUNBUFFERED=1 \
-    OUTLOOK_EMAIL=andrey.koldayev@r-express.ru \
-    OUTLOOK_PASSWORD=fUsVzN99! \
-    TARGET_EMAIL=andrey.koldayev@r-express.ru \
-    API_URL=https://megapolus.bitrix24.ru/rest/11/pbjl5ed8q1303lh0/bizproc.workflow.start \
-    STORAGE_ENDPOINT=https://storage.yandexcloud.net \
-    STORAGE_BUCKET=cdn.mt-app.ru \
-    STORAGE_STATE_KEY=playwright/storage_state.json \
-    STORAGE_ACCESS_KEY=YCAJEeWXehH3VGs3lWYglf2rH \
-    STORAGE_SECRET_KEY=YCNSM6PNZ2bXop1KrwM_9Ko181cjHMUYxZx4gDhR
+    PLAYWRIGHT_HEADLESS=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Запуск приложения
 CMD ["python", "app.py"]

@@ -4,3 +4,4 @@ beautifulsoup4==4.12.3
 lxml==5.3.0
 boto3==1.35.15
 email-validator==2.1.0.post1
+python-dotenv

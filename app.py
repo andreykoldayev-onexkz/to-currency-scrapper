@@ -5,6 +5,7 @@ app.py
 Сохраняет cookies Playwright в папку playwright_sessions для повторного использования.
 """
 
+from dotenv import load_dotenv
 import os
 import json
 import time
@@ -32,6 +33,7 @@ from playwright.async_api import async_playwright, Browser, Page
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
+load_dotenv()
 
 class CurrencyScraperError(Exception):
     '''Кастомное исключение для ошибок скреппинга'''
@@ -172,10 +174,32 @@ class PlaywrightHelper:
         browser = None
         context = None
         try:
+            logger.info(f"Starting Playwright for {url}")
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-gpu",
+                        "--disable-software-rasterizer",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                        "--disable-features=TranslateUI,IsolateOrigins,site-per-process",
+                        "--disable-hang-monitor",
+                        "--disable-popup-blocking",
+                        "--disable-prompt-on-repost",
+                        "--disable-sync",
+                        "--no-first-run",
+                        "--no-zygote",
+                        "--disable-accelerated-2d-canvas",
+                        "--disable-webgl",
+                    ],
                 )
                 context_kwargs = {
                     "viewport": {"width": 1280, "height": 800},
