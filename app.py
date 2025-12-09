@@ -355,6 +355,16 @@ class CurrencyScraper:
                         raise Exception("Playwright returned interstitial / challenge page")
 
                     return BeautifulSoup(html, 'html.parser')
+                
+                if 'kazunion.ru' in url:
+                    logger.info(f"Using Playwright for {url} (attempt {attempt+1})")
+                    html = self.playwright.fetch(
+                        url,
+                        wait_selector='#exchange-rates-table tbody tr',
+                    )
+                    if not html:
+                        raise Exception("Playwright failed to fetch HTML")
+                    return BeautifulSoup(html, 'html.parser')
 
                 if 'cruclub.ru' in url:
                     temp_session = requests.Session()
@@ -1327,6 +1337,49 @@ class CurrencyScraper:
             }
         ]
 
+    def scrape_kazunion_site(self, url: str) -> List[Dict]:
+        '''Скреппинг сайта Казахстанского Союза через API'''
+        api_url = 'https://integrations-main.kazunion.com/api/Currency/GetExchangeRates'
+        
+        try:
+            headers = self.get_random_headers()
+            response = self.session.get(api_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            usd_rate = None
+            eur_rate = None
+            
+            for item in data:
+                if item.get('convertFrom') == 'USD' and item.get('convertTo') == 'RUB':
+                    usd_rate = item.get('rate')
+                elif item.get('convertFrom') == 'EUR' and item.get('convertTo') == 'RUB':
+                    eur_rate = item.get('rate')
+            
+            return [
+                {
+                    'id': 28213,
+                    'sectionId': 683,
+                    'name': 'EUR',
+                    'touroperator': 'Казахстанский Союз',
+                    'rate': eur_rate,
+                    'percentToCb': '',
+                    'delta': ''
+                },
+                {
+                    'id': 28215,
+                    'sectionId': 683,
+                    'name': 'USD',
+                    'touroperator': 'Казахстанский Союз',
+                    'rate': usd_rate,
+                    'percentToCb': '',
+                    'delta': ''
+                }
+            ]
+        except Exception as e:
+            logger.error(f"Ошибка при получении данных из API Казахстанский Союз: {e}")
+            return []
+
     def scrape_all_sites(self) -> Dict:
         '''Скреппинг всех сайтов'''
         sites_config = [
@@ -1420,6 +1473,11 @@ class CurrencyScraper:
                 'name': 'Space Travel', 
                 'url': 'https://www.space-travel.ru/',  
                 'scraper': self.scrape_space_travel_site
+            },
+            {
+                'name': 'Казахстанский Союз',
+                'url': 'https://kazunion.ru/',
+                'scraper': self.scrape_kazunion_site
             }
         ]
         
