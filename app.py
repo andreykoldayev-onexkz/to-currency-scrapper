@@ -338,7 +338,13 @@ class CurrencyScraper:
                     logger.info(f"Using Playwright for {url} (attempt {attempt+1})")
                     html = self.playwright.fetch(
                         url,
-                        wait_selector='table.mod_rate_today',
+                        wait_selector=(
+                            'table.mod_rate_today, '
+                            '.mod_rate_oper, '
+                            '[class*="rate"], [id*="rate"], '
+                            '[class*="currency"], [id*="currency"], '
+                            '[class*="kurs"], [id*="kurs"]'
+                        ),
                     )
                     if not html:
                         raise Exception("Playwright failed to fetch HTML")
@@ -415,32 +421,27 @@ class CurrencyScraper:
         operators = [
             {'id': 3153, 'sectionId': 539, 'name': 'EUR', 'touroperator': 'ЦБ РФ'},
             {'id': 3167, 'sectionId': 539, 'name': 'USD', 'touroperator': 'ЦБ РФ'},
-            {'id': 3141, 'sectionId': 527, 'name': 'EUR', 'touroperator': 'Корал Тревел'},
-            {'id': 3155, 'sectionId': 527, 'name': 'USD', 'touroperator': 'Корал Тревел'},
-            {'id': 3147, 'sectionId': 531, 'name': 'EUR', 'touroperator': 'Санмар'},
-            {'id': 3161, 'sectionId': 531, 'name': 'USD', 'touroperator': 'Санмар'},
-            {'id': 3151, 'sectionId': 535, 'name': 'EUR', 'touroperator': 'Фан & Сан'},
-            {'id': 3165, 'sectionId': 535, 'name': 'USD', 'touroperator': 'Фан & Сан'},
-            {'id': 3129, 'sectionId': 521, 'name': 'EUR', 'touroperator': 'Анекс Тур'},
-            {'id': 3131, 'sectionId': 521, 'name': 'USD', 'touroperator': 'Анекс Тур'},
-            {'id': 3143, 'sectionId': 529, 'name': 'EUR', 'touroperator': 'Пегас Туристик'},
-            {'id': 3157, 'sectionId': 529, 'name': 'USD', 'touroperator': 'Пегас Туристик'},
+            {'id': 3141, 'sectionId': 527, 'name': 'EUR', 'touroperator': 'Coral Travel'},
+            {'id': 3155, 'sectionId': 527, 'name': 'USD', 'touroperator': 'Coral Travel'},
+            {'id': 3147, 'sectionId': 531, 'name': 'EUR', 'touroperator': 'Sunmar'},
+            {'id': 3161, 'sectionId': 531, 'name': 'USD', 'touroperator': 'Sunmar'},
+            {'id': 3151, 'sectionId': 535, 'name': 'EUR', 'touroperator': 'FUN&SUN'},
+            {'id': 3165, 'sectionId': 535, 'name': 'USD', 'touroperator': 'FUN&SUN'},
+            {'id': 3129, 'sectionId': 521, 'name': 'EUR', 'touroperator': 'Anex Tour'},
+            {'id': 3131, 'sectionId': 521, 'name': 'USD', 'touroperator': 'Anex Tour'},
+            {'id': 3143, 'sectionId': 529, 'name': 'EUR', 'touroperator': 'PEGAS Touristik'},
+            {'id': 3157, 'sectionId': 529, 'name': 'USD', 'touroperator': 'PEGAS Touristik'},
             {'id': 3145, 'sectionId': 537, 'name': 'EUR', 'touroperator': 'Русский Экспресс'},
             {'id': 3159, 'sectionId': 537, 'name': 'USD', 'touroperator': 'Русский Экспресс'},
             {'id': 3133, 'sectionId': 523, 'name': 'EUR', 'touroperator': 'Библио-Глобус'},
             {'id': 3135, 'sectionId': 523, 'name': 'USD', 'touroperator': 'Библио-Глобус'},
             {'id': 3137, 'sectionId': 525, 'name': 'EUR', 'touroperator': 'Интурист'},
             {'id': 3139, 'sectionId': 525, 'name': 'USD', 'touroperator': 'Интурист'},
-            {'id': 3149, 'sectionId': 533, 'name': 'EUR', 'touroperator': 'Тез-Тур'},
-            {'id': 3163, 'sectionId': 533, 'name': 'USD', 'touroperator': 'Тез-Тур'},
-            {'id': 17561, 'sectionId': 665, 'name': 'EUR', 'touroperator': 'Лоти'},
-            {'id': 17563, 'sectionId': 665, 'name': 'USD', 'touroperator': 'Лоти'}
+            {'id': 3149, 'sectionId': 533, 'name': 'EUR', 'touroperator': 'TEZ TOUR'},
+            {'id': 3163, 'sectionId': 533, 'name': 'USD', 'touroperator': 'TEZ TOUR'},
+            {'id': 17561, 'sectionId': 665, 'name': 'EUR', 'touroperator': 'LOTI'},
+            {'id': 17563, 'sectionId': 665, 'name': 'USD', 'touroperator': 'LOTI'}
         ]
-
-        table = soup.find('table', class_='mod_rate_today')
-        if not table:
-            logger.error("mod_rate_today table not found on tour-kassa")
-            return []
 
         # Группировка операторов
         operator_groups = {}
@@ -448,68 +449,278 @@ class CurrencyScraper:
             if op['touroperator'] not in operator_groups:
                 operator_groups[op['touroperator']] = []
             operator_groups[op['touroperator']].append(op)
-        
+
+        rates_root = self._find_tour_kassa_rates_root(soup, operator_groups.keys())
+        if not rates_root:
+            logger.error("Rates block not found on tour-kassa")
+            return []
+
         # Обработка каждого оператора
         for operator_name, operator_items in operator_groups.items():
-            operator_data = self._get_exchange_rates_by_operator(table, operator_name)
-            
-            if operator_data:
-                for item in operator_items:
-                    currency_data = operator_data['EUR'] if item['name'] == 'EUR' else operator_data['USD']
-                    
-                    results.append({
-                        'id': item['id'],
-                        'sectionId': item['sectionId'],
-                        'name': item['name'],
-                        'touroperator': item['touroperator'],
-                        'rate': currency_data['rate'],
-                        'percentToCb': currency_data['percentage'],
-                        'delta': currency_data['delta']
-                    })
-        
+            operator_data = self._get_exchange_rates_by_operator(rates_root, operator_name)
+
+            if not operator_data:
+                logger.warning(f"Rates not found for tour-kassa operator: {operator_name}")
+                continue
+
+            for item in operator_items:
+                currency_data = operator_data.get(item['name'])
+                if not currency_data or not currency_data.get('rate'):
+                    logger.warning(
+                        f"{item['name']} rate not found for tour-kassa operator: {operator_name}"
+                    )
+                    continue
+
+                results.append({
+                    'id': item['id'],
+                    'sectionId': item['sectionId'],
+                    'name': item['name'],
+                    'touroperator': item['touroperator'],
+                    'rate': currency_data.get('rate'),
+                    'percentToCb': currency_data.get('percentage', ''),
+                    'delta': currency_data.get('delta', '')
+                })
+
         return results
     
-    def _get_exchange_rates_by_operator(self, table: BeautifulSoup, operator_name: str) -> Optional[Dict]:
-        '''Извлекает блоки с курсами конкретного туроператора'''
-        rows = table.find_all('tr')
-        target_name = self._normalize_operator_name(operator_name)
+    def _find_tour_kassa_rates_root(self, soup: BeautifulSoup, operator_names) -> Optional[BeautifulSoup]:
+        """Находит актуальный блок с курсами TourKassa без привязки к старому table.mod_rate_today."""
+        normalized_names = [self._normalize_operator_name(name) for name in operator_names]
+
+        candidates = []
+
+        old_table = soup.find('table', class_='mod_rate_today')
+        if old_table:
+            candidates.append(old_table)
+
+        candidates.extend(soup.find_all('table'))
+        candidates.extend(
+            soup.select(
+                '[class*="rate"], [id*="rate"], '
+                '[class*="currency"], [id*="currency"], '
+                '[class*="kurs"], [id*="kurs"]'
+            )
+        )
+
+        best_candidate = None
+        best_score = 0
+        seen = set()
+
+        for candidate in candidates:
+            candidate_id = id(candidate)
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+
+            text = self._normalize_operator_name(candidate.get_text(" ", strip=True))
+            if not text:
+                continue
+
+            operator_hits = sum(
+                1 for name in normalized_names
+                if name and (name in text or text in name)
+            )
+            rate_hits = len(re.findall(r'\d+[.,]\d+', text))
+
+            if operator_hits and rate_hits:
+                score = operator_hits * 100 + rate_hits
+                if score > best_score:
+                    best_score = score
+                    best_candidate = candidate
+
+        return best_candidate
+
+
+    def _get_exchange_rates_by_operator(self, root: BeautifulSoup, operator_name: str) -> Optional[Dict]:
+        """Извлекает EUR/USD для оператора из старой таблицы или нового адаптивного блока TourKassa."""
+        target_aliases = self._operator_aliases(operator_name)
+
+        rows = root.find_all('tr')
+
+        if not rows:
+            rows = root.find_all(
+                lambda tag: (
+                    tag.name in ('div', 'li', 'section', 'article')
+                    and tag.get_text(" ", strip=True)
+                    and any(alias in self._normalize_operator_name(tag.get_text(" ", strip=True)) for alias in target_aliases)
+                    and len(re.findall(r'\d+[.,]\d+', tag.get_text(" ", strip=True))) >= 2
+                )
+            )
 
         for row in rows:
-            operator_cell = row.find('td', class_='mod_rate_oper')
-            if not operator_cell:
+            row_text = row.get_text(" ", strip=True)
+            normalized_row_text = self._normalize_operator_name(row_text)
+
+            if not any(alias in normalized_row_text for alias in target_aliases):
                 continue
 
-            div_element = operator_cell.find('div')
-            if not div_element:
-                continue
+            cells = row.find_all(['td', 'th'])
+            if cells:
+                eur_data = self._extract_tour_kassa_currency_from_cells(cells, 'EUR')
+                usd_data = self._extract_tour_kassa_currency_from_cells(cells, 'USD')
 
-            operator_text = div_element.get_text(strip=True).split('\n')[0].strip()
-            normalized_operator = self._normalize_operator_name(operator_text)
-
-            if (
-                normalized_operator == target_name
-                or target_name in normalized_operator
-                or normalized_operator in target_name
-            ):
-                cells = row.find_all('td')
-                if len(cells) >= 7:
+                if eur_data.get('rate') or usd_data.get('rate'):
                     return {
-                        'EUR': {
-                            'rate': self.extract_rate(cells[1].get_text(strip=True)),
-                            'percentage': cells[2].get_text(strip=True),
-                            'delta': cells[3].get_text(strip=True)
-                        },
-                        'USD': {
-                            'rate': self.extract_rate(cells[4].get_text(strip=True)),
-                            'percentage': cells[5].get_text(strip=True),
-                            'delta': cells[6].get_text(strip=True)
-                        },
+                        'EUR': eur_data,
+                        'USD': usd_data,
                     }
+
+            text_data = self._extract_tour_kassa_currency_from_text(row_text)
+            if text_data:
+                return text_data
 
         return None
 
+
+    def _extract_tour_kassa_currency_from_cells(self, cells, currency: str) -> Dict:
+        """Достает курс/процент/дельту из строки TourKassa без жесткой зависимости от номеров колонок."""
+        markers = {
+            'EUR': ['eur', 'евро', '€'],
+            'USD': ['usd', 'доллар', '$'],
+        }
+
+        fallback_start = 1 if currency == 'EUR' else 4
+        signatures = [self._cell_signature(cell) for cell in cells]
+
+        start_index = None
+        for index, signature in enumerate(signatures):
+            if any(marker in signature for marker in markers[currency]):
+                start_index = index
+                break
+
+        if start_index is None:
+            start_index = fallback_start
+
+        end_index = min(len(cells), start_index + 4)
+
+        if currency == 'EUR':
+            for index in range(start_index + 1, len(cells)):
+                if any(marker in signatures[index] for marker in markers['USD']):
+                    end_index = index
+                    break
+
+        block = cells[start_index:end_index]
+        if not block and fallback_start < len(cells):
+            block = cells[fallback_start:min(len(cells), fallback_start + 3)]
+
+        texts = [cell.get_text(" ", strip=True) for cell in block if cell.get_text(" ", strip=True)]
+
+        rate = None
+        rate_text_index = None
+        for index, text in enumerate(texts):
+            candidate = self.extract_rate(text)
+            if candidate:
+                rate = candidate
+                rate_text_index = index
+                break
+
+        percentage = ''
+        delta = ''
+
+        for text in texts:
+            if '%' in text:
+                percentage = text
+                break
+
+        for index, text in enumerate(texts):
+            if index == rate_text_index or text == percentage:
+                continue
+            if re.search(r'^[+\-−]|[↑↓]', text):
+                delta = text
+                break
+
+        return {
+            'rate': rate,
+            'percentage': percentage,
+            'delta': delta,
+        }
+
+
+    def _extract_tour_kassa_currency_from_text(self, text: str) -> Optional[Dict]:
+        """Fallback для карточек/списков, если TourKassa ушла от таблицы к div-разметке."""
+        normalized_text = self._normalize_operator_name(text)
+        numbers = [value.replace(',', '.') for value in re.findall(r'\d+[.,]\d+', text)]
+
+        if len(numbers) < 2:
+            return None
+
+        eur_rate = None
+        usd_rate = None
+
+        eur_match = re.search(r'(?:eur|евро|€)\D{0,40}(\d+[.,]\d+)', text, re.IGNORECASE)
+        usd_match = re.search(r'(?:usd|доллар|\$)\D{0,40}(\d+[.,]\d+)', text, re.IGNORECASE)
+
+        if eur_match:
+            eur_rate = eur_match.group(1).replace(',', '.')
+        if usd_match:
+            usd_rate = usd_match.group(1).replace(',', '.')
+
+        # Если валюта явно не подписана, оставляем совместимость со старым порядком: EUR затем USD.
+        if not eur_rate and not usd_rate and ('eur' in normalized_text or 'usd' in normalized_text):
+            eur_rate = numbers[0]
+            usd_rate = numbers[1] if len(numbers) > 1 else None
+
+        if not eur_rate and not usd_rate:
+            return None
+
+        return {
+            'EUR': {
+                'rate': eur_rate,
+                'percentage': '',
+                'delta': '',
+            },
+            'USD': {
+                'rate': usd_rate,
+                'percentage': '',
+                'delta': '',
+            },
+        }
+
+
+    def _cell_signature(self, cell) -> str:
+        """Текст + служебные атрибуты ячейки: class, id, data-label и т.п."""
+        attr_values = []
+
+        for attr in ('class', 'id', 'data-label', 'data-title', 'aria-label', 'title'):
+            value = cell.get(attr)
+            if not value:
+                continue
+            if isinstance(value, list):
+                attr_values.extend(str(item) for item in value)
+            else:
+                attr_values.append(str(value))
+
+        attr_values.append(cell.get_text(" ", strip=True))
+        return self._normalize_operator_name(" ".join(attr_values))
+
+
+    def _operator_aliases(self, name: str) -> List[str]:
+        normalized = self._normalize_operator_name(name)
+
+        aliases = {
+            'цб рф': ['цб', 'цб рф', 'центральный банк', 'центробанк'],
+            'корал тревел': ['корал тревел', 'coral travel'],
+            'санмар': ['санмар', 'sunmar'],
+            'фан сан': ['фан сан', 'fun sun', 'fun and sun', 'tui'],
+            'анекс тур': ['анекс тур', 'anex tour', 'anextour'],
+            'пегас туристик': ['пегас туристик', 'pegas', 'pegas touristik'],
+            'русский экспресс': ['русский экспресс', 'russian express'],
+            'библио глобус': ['библио глобус', 'библиоглобус', 'biblio globus', 'biblioglobus'],
+            'интурист': ['интурист', 'intourist'],
+            'тез тур': ['тез тур', 'tez tour', 'tez-tour'],
+            'лоти': ['лоти', 'loti'],
+        }
+
+        result = [normalized]
+        result.extend(aliases.get(normalized, []))
+
+        return list(dict.fromkeys(alias for alias in result if alias))
+
     @staticmethod
     def _normalize_operator_name(name: str) -> str:
+        name = str(name or '').replace('ё', 'е').replace('Ё', 'Е')
+        name = name.replace('&', ' and ')
+        name = re.sub(r'[^0-9a-zA-Zа-яА-Я]+', ' ', name)
         return re.sub(r'\s+', ' ', name).strip().lower()
 
     def scrape_paks_site(self, url: str) -> List[Dict]:
